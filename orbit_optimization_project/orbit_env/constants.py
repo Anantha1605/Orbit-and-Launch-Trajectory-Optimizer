@@ -28,7 +28,7 @@ MISSION_COVERAGE_RANGE = (700.0, 1500.0 + SAFETY_BUFFER_DISTANCE)   # km
 SAFETY_DISTANCE_WEIGHT = 1
 COVERAGE_ERROR_WEIGHT = 1
 TARGET_VALIDITY_WEIGHT = 1
-MAX_STEPS = 500                            # Maximum steps per episode
+MAX_STEPS = 300                            # Maximum steps per episode
 
 
 

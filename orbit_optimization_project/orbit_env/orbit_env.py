@@ -148,14 +148,14 @@ class OrbitEnv(Env):
 
         # New observation
         coverage_valid = int(self.check_coverage_error(self.current_orbit))
-        safety_valid = int(self.check_safety_buffer_distance(self.current_orbit))
+        _, safety_valid = self.check_safety_buffer_distance(self.current_orbit)
         _, target_valid = self.check_ground_target_validity(self.current_orbit)
 
         observation = {
-            "orbital_elements": np.array(self.current_orbit, dtype=np.float32),
+            "orbital_elements": np.array(self.current_orbit, dtype=np.float32),  # True Anomaly is irrelevant
             "Ground_target_valid": int(target_valid),
-            "Coverage_error": coverage_valid,
-            "safety_buffer_distance": safety_valid,
+            "Coverage_error": int(coverage_valid),
+            "safety_buffer_distance": int(safety_valid),
         }
 
         done = info.get('all_objectives_met', False)
@@ -176,15 +176,15 @@ class OrbitEnv(Env):
         self.steps = 0
 
         # constraint validation
-        safety_valid = self.check_safety_buffer_distance(self.current_orbit)
         coverage_valid = self.check_coverage_error(self.current_orbit)
+        safety_valid = self.check_safety_buffer_distance(self.current_orbit)
         _, target_valid = self.check_ground_target_validity(self.current_orbit)
 
         observation = {
             "orbital_elements": np.array(self.current_orbit, dtype=np.float32),  # True Anomaly is irrelevant
             "Ground_target_valid": int(target_valid),
-            "Coverage_error": coverage_valid,
-            "safety_buffer_distance": safety_valid,
+            "Coverage_error": int(coverage_valid),
+            "safety_buffer_distance": int(safety_valid[1]),
         }
 
         info = {}
@@ -238,6 +238,8 @@ class OrbitEnv(Env):
         from .constants import EARTH_MU, SAFETY_BUFFER_DISTANCE
 
         a1, _, i1, raan1, _ = orbit
+        # distance to nearest orbit
+        d_min = 0
 
         # parsing the orbital TLE data set
         for name, line1, line2 in self.tle_sets:
@@ -266,12 +268,12 @@ class OrbitEnv(Env):
                     d_min = np.sqrt(a1 ** 2 + a2 ** 2 - 2 * a1 * a2 * abs(cos_theta))
 
                 # Buffer distance Check
-                if d_min < SAFETY_BUFFER_DISTANCE: return False # orbit too close -> unsafe
+                if d_min < SAFETY_BUFFER_DISTANCE: return d_min, False # orbit too close -> unsafe
 
             except Exception as e:
                 logging.error("Error: %s", str(e))
                 continue
-        return True # Safety distance maintained w.r.t all orbits
+        return d_min, True # Safety distance maintained w.r.t all orbits
 
     @staticmethod
     def validate_orbital_elements(orbit):
@@ -338,10 +340,12 @@ class OrbitEnv(Env):
         Refined reward function for LEO orbit optimization.
         Applies soft penalties and scaled rewards for better convergence.
         """
-        from .constants import SAFETY_DISTANCE_WEIGHT, TARGET_VALIDITY_WEIGHT, COVERAGE_ERROR_WEIGHT, EARTH_RADIUS, GROUND_TARGET_VARIANCE_THRESHOLD
+        from .constants import SAFETY_DISTANCE_WEIGHT, TARGET_VALIDITY_WEIGHT, COVERAGE_ERROR_WEIGHT, EARTH_RADIUS, GROUND_TARGET_VARIANCE_THRESHOLD, SAFETY_BUFFER_DISTANCE
 
         if not self.validate_orbital_elements(orbit):
-            return -1000, {'error': 'Invalid orbital elements', 'reward': -1000}
+            return -100, {'error': 'Invalid orbital elements', 'reward': -100}
+        else:
+            valid_elements_reward = 10
 
 
         a, e, i, raan, arg_perigee = orbit
@@ -350,43 +354,52 @@ class OrbitEnv(Env):
         # --- Coverage (Altitude) Reward ---
         min_alt, max_alt = self.coverage_error_range
 
-        if min_alt <= mean_alt <= max_alt:
-            coverage_reward = 100
-            coverage_penalty = 0
-        else:
-            coverage_reward = 0
-            coverage_penalty = min(300, abs(mean_alt - np.clip(mean_alt, min_alt, max_alt)) / 100 * 25)
+        coverage_error = abs(mean_alt - np.clip(mean_alt, min_alt, max_alt))
+        normalized_coverage_error = coverage_error / max(1e-6, (max_alt - min_alt))
+
+        coverage_reward = 10 * max(0, 1 - normalized_coverage_error)
+        coverage_penalty = 10 * min(1, normalized_coverage_error)
 
         # --- Safety Distance Reward ---
-        if self.check_safety_buffer_distance(orbit):
-            safety_reward = 100
+        d_min, safety_check = self.check_safety_buffer_distance(orbit)
+
+        safe_margin = d_min - SAFETY_BUFFER_DISTANCE
+        normalized_safety_margin = np.clip(safe_margin / SAFETY_BUFFER_DISTANCE, -1, 1)
+
+        if safety_check:
+            safety_reward = 10 * max(0, normalized_safety_margin)
             safety_penalty = 0
         else:
             safety_reward = 0
-            safety_penalty = 300
+            safety_penalty = 10 * abs(normalized_safety_margin)
+
 
         # --- Ground Target Validity Reward ---
         try:
             distance_to_target, target_validity = self.check_ground_target_validity(orbit)
 
+            normalized_distance = np.clip(distance_to_target / GROUND_TARGET_VARIANCE_THRESHOLD, 0, 2)
+
             if target_validity:
-                target_reward = max(0, 100 - (distance_to_target / GROUND_TARGET_VARIANCE_THRESHOLD) * 50)
+                target_reward = 10 * max(0, 1 - normalized_distance)
                 target_penalty = 0
             else:
                 target_reward = 0
-                target_penalty = min(300, distance_to_target / 100 * 25)
+                target_penalty = 10 * min(1, normalized_distance)
+
 
         except Exception as e:
             logging.error(f"Ground target error: {e}")
             distance_to_target = float('inf')
             target_reward = 0
-            target_penalty = 300
+            target_penalty = 5
 
         # --- Total Reward Calculation ---
         total_reward = (
                 COVERAGE_ERROR_WEIGHT * coverage_reward +
                 SAFETY_DISTANCE_WEIGHT * safety_reward +
-                TARGET_VALIDITY_WEIGHT * target_reward
+                TARGET_VALIDITY_WEIGHT * target_reward +
+                valid_elements_reward
         )
 
         total_penalty = (
@@ -400,8 +413,17 @@ class OrbitEnv(Env):
 
         # Bonus for meeting all 3 objectives
         if coverage_reward > 0 and safety_reward > 0 and target_reward > 0:
-            final_reward += 100
+            final_reward += 15
             objectives_met = True
+
+            # Individual reward boosting
+            if coverage_reward > 8: final_reward += 5
+            if safety_reward > 8: final_reward += 5
+            if target_reward > 8: final_reward += 5
+
+        # Step penalty -> for faster convergence
+        final_reward -= 1
+
 
         diagnostics = {
             'reward': final_reward,
@@ -415,6 +437,9 @@ class OrbitEnv(Env):
             'distance_to_target_km': distance_to_target,
             'all_objectives_met': objectives_met
         }
+
+        # Maximum upper bound of reward -> +69
+        # Maximum lower bound of reward -> -100
 
         return final_reward, diagnostics
 
