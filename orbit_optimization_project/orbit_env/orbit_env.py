@@ -5,7 +5,8 @@ from gymnasium import Env
 import requests
 import numpy as np
 from .active_satellites_orbit_plot import plot_tle
-from .constants import EARTH_RADIUS, MISSION_COVERAGE_RANGE, TLE_SOURCE, TARGET_GROUND_COORDINATES, LEO_E_MAX
+from .constants import (EARTH_RADIUS, MISSION_COVERAGE_RANGE, TLE_SOURCE, TARGET_GROUND_COORDINATES, LEO_E_MAX,
+                        LEO_I_MIN, LEO_I_MAX)
 import random
 import logging
 
@@ -276,38 +277,6 @@ class OrbitEnv(Env):
         return d_min, True # Safety distance maintained w.r.t all orbits
 
     @staticmethod
-    def validate_orbital_elements(orbit):
-        """Validate orbital elements for physical constraints"""
-        a, e, i, raan, arg_perigee = orbit
-
-        # Semi-major axis must be greater than Earth radius
-        if a <= EARTH_RADIUS:
-            logging.error(f"Semi-major axis {a} must be > Earth radius {EARTH_RADIUS}")
-            return False
-
-        # Eccentricity constraints for LEO
-        if not (0 <= e < 1):
-            logging.error(f"Eccentricity {e} must be in range [0, 1)")
-            return False
-
-        # Inclination constraints
-        if not (0 <= i <= np.pi):
-            logging.error(f"Inclination {i} must be in range [0, π]")
-            return False
-
-        # RAAN constraints
-        if not (0 <= raan <= 2 * np.pi):
-            logging.error(f"RAAN {raan} must be in range [0, 2π]")
-            return False
-
-        # Argument of perigee constraints
-        if not (0 <= arg_perigee <= 2 * np.pi):
-            logging.error(f"Argument of perigee {arg_perigee} must be in range [0, 2π]")
-            return False
-
-        return True
-
-    @staticmethod
     def check_ground_target_validity(orbit):
         """
         Using Satellite Sub point approach to determine ground target validity
@@ -342,64 +311,111 @@ class OrbitEnv(Env):
         """
         from .constants import SAFETY_DISTANCE_WEIGHT, TARGET_VALIDITY_WEIGHT, COVERAGE_ERROR_WEIGHT, EARTH_RADIUS, GROUND_TARGET_VARIANCE_THRESHOLD, SAFETY_BUFFER_DISTANCE
 
-        if not self.validate_orbital_elements(orbit):
-            return -100, {'error': 'Invalid orbital elements', 'reward': -100}
-        else:
-            valid_elements_reward = 10
-
 
         a, e, i, raan, arg_perigee = orbit
         mean_alt = a - EARTH_RADIUS
 
         # --- Coverage (Altitude) Reward ---
         min_alt, max_alt = self.coverage_error_range
-
+        coverage_valid = (min_alt <= mean_alt <= max_alt)
         coverage_error = abs(mean_alt - np.clip(mean_alt, min_alt, max_alt))
         normalized_coverage_error = coverage_error / max(1e-6, (max_alt - min_alt))
 
-        coverage_reward = 10 * max(0, 1 - normalized_coverage_error)
-        coverage_penalty = 10 * min(1, normalized_coverage_error)
+        coverage_reward = max(0.0, 1 - normalized_coverage_error)
+        coverage_penalty = min(1.0, normalized_coverage_error)
 
         # --- Safety Distance Reward ---
         d_min, safety_check = self.check_safety_buffer_distance(orbit)
 
         safe_margin = d_min - SAFETY_BUFFER_DISTANCE
-        normalized_safety_margin = np.clip(safe_margin / SAFETY_BUFFER_DISTANCE, -1, 1)
+        normalized_safety_margin = np.clip(safe_margin / SAFETY_BUFFER_DISTANCE, -2.0, 2.0)
 
         if safety_check:
-            safety_reward = 10 * max(0, normalized_safety_margin)
-            safety_penalty = 0
+            safety_reward = max(0.0, normalized_safety_margin)
+            safety_penalty = 0.0
         else:
-            safety_reward = 0
-            safety_penalty = 10 * abs(normalized_safety_margin)
+            safety_reward = 0.0
+            safety_penalty = abs(normalized_safety_margin)
 
 
         # --- Ground Target Validity Reward ---
         try:
             distance_to_target, target_validity = self.check_ground_target_validity(orbit)
 
-            normalized_distance = np.clip(distance_to_target / GROUND_TARGET_VARIANCE_THRESHOLD, 0, 2)
+            normalized_distance = np.clip(distance_to_target / GROUND_TARGET_VARIANCE_THRESHOLD, 0, 1)
 
             if target_validity:
-                target_reward = 10 * max(0, 1 - normalized_distance)
-                target_penalty = 0
+                target_reward = max(0.0, 1 - normalized_distance)
+                target_penalty = 0.0
             else:
-                target_reward = 0
-                target_penalty = 10 * min(1, normalized_distance)
+                target_reward = 0.0
+                target_penalty = min(1.0, normalized_distance)
 
 
         except Exception as e:
             logging.error(f"Ground target error: {e}")
             distance_to_target = float('inf')
-            target_reward = 0
-            target_penalty = 5
+            target_reward = 0.0
+            target_penalty = 1.0
+
+        # --- Individual rewards for a, e, i, raan , and argument of perigee ---
+        # a -> rewards for coverage
+
+        # Eccentricity (e) - Should be low for LEO
+        if e > LEO_E_MAX:
+            e_penalty = min(1.0, (e - LEO_E_MAX) / LEO_E_MAX)  # Normalized penalty
+            e_reward = 0.0
+        else:
+            e_reward = 1.0 - (e / LEO_E_MAX)  # Higher reward for lower eccentricity
+            e_penalty = 0.0
+
+            # Inclination (i) - Should be within LEO range
+        if LEO_I_MIN <= i <= LEO_I_MAX:
+            # Reward for being in valid range, with bonus for optimal inclinations
+            i_range = LEO_I_MAX - LEO_I_MIN
+            i_center = (LEO_I_MIN + LEO_I_MAX) / 2.0
+            i_reward = 1.0 - abs(i - i_center) / (i_range / 2.0)  # Peak reward at center
+            i_penalty = 0.0
+        else:
+            i_reward = 0.0
+            if i < LEO_I_MIN:
+                i_penalty = min(1.0, (LEO_I_MIN - i) / LEO_I_MIN)
+            else:
+                i_penalty = min(1.0, (i - LEO_I_MAX) / (180.0 - LEO_I_MAX))
+
+        """
+        # Right Ascension of Ascending Node (RAAN) - Should be within valid range
+        if LEO_RAAN_MIN <= raan <= LEO_RAAN_MAX:
+            # Uniform reward within valid range
+            raan_reward = 1
+            raan_penalty = 0
+        else:
+            raan_reward = 0
+            # Calculate penalty based on how far outside the valid range
+            if raan < LEO_RAAN_MIN:
+                raan_penalty = min(1, (LEO_RAAN_MIN - raan) / LEO_RAAN_MIN)
+            else:
+                raan_penalty = min(1, (raan - LEO_RAAN_MAX) / (360 - LEO_RAAN_MAX))
+
+            # Argument of Perigee - Should be within valid range
+        if LEO_ARG_PERIGEE_MIN <= arg_perigee <= LEO_ARG_PERIGEE_MAX:
+            # Uniform reward within valid range
+            arg_perigee_reward = 1
+            arg_perigee_penalty = 0
+        else:
+            arg_perigee_reward = 0
+            # Calculate penalty based on how far outside the valid range
+            if arg_perigee < LEO_ARG_PERIGEE_MIN:
+                arg_perigee_penalty = min(1, (LEO_ARG_PERIGEE_MIN - arg_perigee) / LEO_ARG_PERIGEE_MIN)
+            else:
+                arg_perigee_penalty = min(1, (arg_perigee - LEO_ARG_PERIGEE_MAX) / (360 - LEO_ARG_PERIGEE_MAX))
+        """
 
         # --- Total Reward Calculation ---
         total_reward = (
                 COVERAGE_ERROR_WEIGHT * coverage_reward +
                 SAFETY_DISTANCE_WEIGHT * safety_reward +
-                TARGET_VALIDITY_WEIGHT * target_reward +
-                valid_elements_reward
+                TARGET_VALIDITY_WEIGHT * target_reward
         )
 
         total_penalty = (
@@ -408,22 +424,22 @@ class OrbitEnv(Env):
                 TARGET_VALIDITY_WEIGHT * target_penalty
         )
 
+        objectives_met = (coverage_reward > 0 and safety_reward > 0 and target_reward > 0)
         final_reward = total_reward - total_penalty
-        objectives_met = False
 
-        # Bonus for meeting all 3 objectives
-        if coverage_reward > 0 and safety_reward > 0 and target_reward > 0:
-            final_reward += 15
-            objectives_met = True
+        element_reward_sum = e_reward + i_reward
+        element_penalty_sum = e_penalty + i_penalty
 
-            # Individual reward boosting
-            if coverage_reward > 8: final_reward += 5
-            if safety_reward > 8: final_reward += 5
-            if target_reward > 8: final_reward += 5
+        # Bonus for meeting all 3 objectives -> Soft bonus or penalty based on normalized performance
+        reward_ratio = (safety_reward + coverage_reward + target_reward + element_reward_sum) / (5 * 1.0)  # 3 rewards + 2 orbital element rewards
+        penalty_ratio = (safety_penalty + coverage_penalty + target_penalty + element_penalty_sum) / (5 * 1.0)
 
-        # Step penalty -> for faster convergence
-        final_reward -= 1
+        if objectives_met:
+            final_reward += 2.0 * reward_ratio
+        else:
+            final_reward -= 2.0 * penalty_ratio
 
+        final_reward = float(np.clip(final_reward, -10, 10))
 
         diagnostics = {
             'reward': final_reward,
@@ -434,19 +450,15 @@ class OrbitEnv(Env):
             'safety_penalty': safety_penalty,
             'target_reward': target_reward,
             'target_penalty': target_penalty,
+            'e_reward': e_reward,
+            'e_penalty': e_penalty,
+            'i_reward': i_reward,
+            'i_penalty': i_penalty,
             'distance_to_target_km': distance_to_target,
             'all_objectives_met': objectives_met
         }
 
-        # Maximum upper bound of reward -> +69
-        # Maximum lower bound of reward -> -100
+        # Maximum upper bound of reward -> +10
+        # Maximum lower bound of reward -> -10
 
         return final_reward, diagnostics
-
-
-
-
-
-
-
-
