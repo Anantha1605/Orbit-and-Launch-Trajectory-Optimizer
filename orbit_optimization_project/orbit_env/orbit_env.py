@@ -6,7 +6,7 @@ import requests
 import numpy as np
 from .active_satellites_orbit_plot import plot_tle
 from .constants import (EARTH_RADIUS, MISSION_COVERAGE_RANGE, TLE_SOURCE, TARGET_GROUND_COORDINATES, LEO_E_MAX,
-                        LEO_I_MIN, LEO_I_MAX)
+                        LEO_I_MIN, LEO_I_MAX, SEED)
 import random
 import logging
 
@@ -54,6 +54,10 @@ class OrbitEnv(Env):
     """
 
     def __init__(self):
+        # Setting the seed value
+        np.random.seed(SEED)
+        random.seed(SEED)
+
         # TLE Data from URL
         TLE_URL = TLE_SOURCE
         response = requests.get(TLE_URL)
@@ -165,7 +169,11 @@ class OrbitEnv(Env):
 
         return observation, reward, done, truncated, info
 
-    def reset(self, *, seed = None, options=None):
+    def reset(self, *, seed = SEED, options=None):
+        # Setting the seed value
+        np.random.seed(seed)
+        random.seed(seed)
+
         a = random.uniform(EARTH_RADIUS + self.coverage_error_range[0],
                            EARTH_RADIUS + self.coverage_error_range[1])
         e = random.uniform(0.0, 0.01)
@@ -317,11 +325,11 @@ class OrbitEnv(Env):
 
         # --- Coverage (Altitude) Reward ---
         min_alt, max_alt = self.coverage_error_range
-        coverage_valid = (min_alt <= mean_alt <= max_alt)
+        #coverage_valid = (min_alt <= mean_alt <= max_alt)
         coverage_error = abs(mean_alt - np.clip(mean_alt, min_alt, max_alt))
         normalized_coverage_error = coverage_error / max(1e-6, (max_alt - min_alt))
 
-        coverage_reward = max(0.0, 1 - normalized_coverage_error)
+        coverage_reward = max(0.0, 1.0 - normalized_coverage_error)
         coverage_penalty = min(1.0, normalized_coverage_error)
 
         # --- Safety Distance Reward ---
