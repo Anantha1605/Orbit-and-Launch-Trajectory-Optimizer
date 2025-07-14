@@ -433,7 +433,7 @@ class OrbitEnv(Env):
         )
 
         objectives_met = (coverage_reward > 0 and safety_reward > 0 and target_reward > 0)
-        final_reward = total_reward - total_penalty
+        objectives_met_ratio = (coverage_reward + safety_reward + target_reward) / 3
 
         element_reward_sum = e_reward + i_reward
         element_penalty_sum = e_penalty + i_penalty
@@ -443,9 +443,11 @@ class OrbitEnv(Env):
         penalty_ratio = (safety_penalty + coverage_penalty + target_penalty + element_penalty_sum) / (5 * 1.0)
 
         if objectives_met:
-            final_reward += 2.0 * reward_ratio
+            total_reward += objectives_met_ratio * reward_ratio
         else:
-            final_reward -= 2.0 * penalty_ratio
+            total_penalty += (1-objectives_met_ratio) * penalty_ratio
+
+        final_reward = total_reward - total_penalty
 
         final_reward = float(np.clip(final_reward, -10, 10))
 
@@ -470,3 +472,15 @@ class OrbitEnv(Env):
         # Maximum lower bound of reward -> -10
 
         return final_reward, diagnostics
+
+    # !! Implemented for the custom callback function to better handle learning plateau !!
+    def random_relocate(self):
+        a = random.uniform(EARTH_RADIUS + self.coverage_error_range[0],
+                           EARTH_RADIUS + self.coverage_error_range[1])
+        e = random.uniform(0.0, 0.01)
+        i = random.uniform(0, np.pi / 2)
+        raan = random.uniform(0, 2 * np.pi)
+        arg_of_perigee = random.uniform(0, 2 * np.pi)
+
+        self.current_orbit = np.array([a, e, i, raan, arg_of_perigee], dtype=np.float32)
+        logging.info("Relocation triggered: new orbit = %s", self.current_orbit)
