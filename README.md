@@ -6,16 +6,17 @@ This project aims to optimize satellite orbits using **Reinforcement Learning (R
 
 
 ## Project Structure
+```text
 orbit_optimization_project/
 │
 ├── orbit_env/
 │   ├── __init__.py
-│   ├── orbit_env.py                # Custom Gymnasium environment
-│   ├── constants.py                # Physical constants and thresholds
+│   ├── orbit_env.py                     # Custom Gymnasium environment
+│   ├── constants.py                     # Physical constants and thresholds
 │   ├── active_satellites_orbit_plot.py  # Orbit visualization utilities
 │
-├── __init__.py                     # Environment registration
-
+├── __init__.py                          # Environment registration
+```                 
 
 
 ## Objective
@@ -44,7 +45,7 @@ to **maximize a reward function** derived from:
 * **Observation Space**: Dict space with orbital elements and validity flags.
 * **Action Space**: Continuous Box space `[a, e, i, RAAN, ω]`.
 
-### 🧮 Custom Reward Function
+### Custom Reward Function
 
 Reward is based on:
 
@@ -69,7 +70,7 @@ policy_kwargs = {
 }
 ```
 
-#### 🔬 Impact:
+#### Impact:
 
 * **Deep network**: Allows for capturing more complex patterns and nonlinearities in orbital mechanics.
 * **LeakyReLU**: Prevents dying neuron problem common with ReLU, especially beneficial in sparse-reward problems like orbital optimization.
