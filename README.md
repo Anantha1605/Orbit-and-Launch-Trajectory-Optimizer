@@ -1,7 +1,7 @@
 
 # Orbit Optimization using Reinforcement Learning
 
-This project aims to optimize satellite orbits using **Reinforcement Learning (RL)**, leveraging `Stable-Baselines3` (SB3) PPO algorithm + MultiInputPolicy and a custom Gymnasium environment. The agent learns to adjust key orbital parameters to satisfy specific mission constraints such as ground target visibility, safety buffer zones, and optimal coverage.
+This project aims to optimize satellite orbits using **Reinforcement Learning (RL)**, leveraging `Stable-Baselines3` (SB3) PPO, and A2C algorithm + MultiInputPolicy and a custom Gymnasium environment. The agent learns to adjust key orbital parameters to satisfy specific mission constraints such as ground target visibility, safety buffer zones, and optimal coverage.
 
 
 
@@ -61,7 +61,7 @@ Reward is based on:
 
 ```python
 policy_kwargs = {
-    'activation_fn': LeakyReLU,
+    'activation_fn': "LeakyReLU",
     'net_arch': {
         'pi': [512, 256, 128],
         'vf': [512, 256, 128],

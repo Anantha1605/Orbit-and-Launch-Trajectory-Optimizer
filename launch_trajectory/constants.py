@@ -22,7 +22,7 @@ R_km = 6378.137          # Earth radius -> in km
 R = R_km * 1000          # Earth radius -> in meters
 
 # Rocket
-m = 75e4                # Initial mass including fuel -> in kg
+rocket_mass = 75e4                # Initial mass including fuel -> in kg
 
 # Atmospheric model
 rho0 = 1.225             # kg/m^3 -> at sea level
@@ -35,9 +35,9 @@ CdA = Cd * A             # For drag force
 g = 9.80665             # m/s^2
 
 # Useful derived values
-F_g = G * M * m / R**2  # Gravitational force at Earth's surface
-escape_velocity = np.sqrt(2 * G * M / R)  # m/s
-orbital_velocity = np.sqrt(G * M / R)
+F_g = G * M * rocket_mass / R**2  # Gravitational force at Earth's surface
+escape_velocity = np.sqrt(2 * G * M / a)  # m/s
+orbital_velocity = np.sqrt(G * M / a)
 
 """
 Assumption:- The orbit is LEO, thus the eccentricity is ~0.025, a nearly circular orbit -> semi major axis (a) = radius (r)
@@ -47,6 +47,8 @@ Assumption:- The orbit is LEO, thus the eccentricity is ~0.025, a nearly circula
 coordinates = (1.3, 31.3)   # latitude and longitude of ground launch coordinates -> in degrees
 launch_lat = np.radians(coordinates[0])
 launch_lon = np.radians(coordinates[1])
+launch_direction = np.array([0.0, 0.0, 1.0])  # Simplified vertical launch
+
 
 # Launch azimuth limits for prograde launch
 # Works if inclination > latitude (for LEO)
@@ -60,7 +62,17 @@ earth_rotation_rate = 7.2921159e-5  # rad/s
 # Thrust and burn parameters for rocket propulsion
 T = 3.5e6         # Thrust in Newtons (adjust per case)
 mdot = 250        # Mass depletion rate in kg/s
-burn_time = m / mdot  # seconds (approx)
+burn_time = rocket_mass / mdot  # seconds (approx)
+Isp = 300         # seconds (typical for chemical rockets)
+
+# Weights [physics, initial, terminal, fuel efficiency]
+weights = {
+    "phys": 1.0,
+    "init": 1.0,
+    "term": 1.0,
+    "fuel": 1.0
+}
+
 
 
 
