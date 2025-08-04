@@ -1,6 +1,8 @@
 import numpy as np
 from constants import R as earth_radius, earth_rotation_rate
 
+def min_orbital_velocity(G, M, R):
+    return np.sqrt(G*M/R)
 def convert_to_eci(lat, lon, t=0):
     """
     Convert launch site to ECI coordinates at time t. t-> time since epoch
@@ -123,4 +125,36 @@ if __name__ == "__main__":
     print("Optimal true anomaly:", nu)
 """
 
+# Defining the PDE's to be solved by the PINN
+"""
+dr/dt = v
+dv/dt = a{gravity} + a{thrust}
+dm/dt = -T(t)/(Isp*g0) -> Isp: Specific impulse
+"""
+
+# PINN design
+"""
+Input: time 
+Outputs: position r(x, y, z), velocity v(x, y, z), mass m(t)
+
+Constraints:
+    - Satisfy Equations of Motion
+    Initial conditions:
+        - r(x, y, z) -> launch site ECI
+        - v(x, y, z) -> 0 or launch pad direction
+        - m(t) -> initial mass of rocket
+        
+    Terminal conditions:
+    - r(x, y, z) -> r(target)
+    - v(x, y, z) -> orbital velocity for altitude
+    - m(t) -> initial mass of rocket
+"""
+
+# Loss Function
+"""
+L{total} =  w{EOM} * L{EOM} + 
+            w{initial condition} * L{initial condition} + 
+            w{target} * L{target} + 
+            w{fuel} * L{fuel} # Mass depletion rate loss
+"""
 
