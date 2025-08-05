@@ -308,7 +308,7 @@ def train(model, epochs, optimizer,t_phys, t0, tf,r0, v0, m0,r_target):
 
 if __name__ == "__main__":
     # Model definition
-    model = PINN(layers=[1, 64, 64, 64, 7])  # 1 input (time), 7 outputs
+    model = PINN(layers=[1, 32, 64, 32, 7])  # 1 input (time), 7 outputs
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # Time points
@@ -328,7 +328,7 @@ if __name__ == "__main__":
                             dtype=torch.float32).view(1, 3)
 
     # Train
-    train(model, epochs=500000, optimizer=optimizer,
+    train(model, epochs=5000, optimizer=optimizer,
           t_phys=t_phys, t0=t0, tf=tf,
           r0=r0, v0=v0, m0=m0,
           r_target=r_target)
