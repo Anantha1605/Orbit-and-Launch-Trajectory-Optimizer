@@ -1,3 +1,5 @@
+# constants.py
+
 import numpy as np
 
 # Orbital parameters
@@ -23,13 +25,6 @@ R = R_km * 1000          # Earth radius -> in meters
 
 # Rocket
 rocket_mass = 75e4                # Initial mass including fuel -> in kg
-
-# Atmospheric model
-rho0 = 1.225             # kg/m^3 -> at sea level
-H = 8500                 # m (scale height)
-Cd = 0.75                # drag coefficient (assumed)
-A = 10                   # m^2 (assumed cross-sectional area)
-CdA = Cd * A             # For drag force
 
 # Standard gravity
 g = 9.80665             # m/s^2
@@ -61,17 +56,19 @@ earth_rotation_rate = 7.2921159e-5  # rad/s
 
 # Thrust and burn parameters for rocket propulsion
 T = 3.5e6         # Thrust in Newtons (adjust per case)
-mdot = 250        # Mass depletion rate in kg/s
-burn_time = rocket_mass / mdot  # seconds (approx)
 Isp = 300         # seconds (typical for chemical rockets)
+mdot = T / (Isp * g) # Mass depletion rate in kg/s
+burn_time = rocket_mass / mdot  # seconds (approx)
+
 
 # Weights [physics, initial, terminal, fuel efficiency]
 weights = {
-    "phys": 1.0,
+    "phys": 10.0,
     "init": 1.0,
     "term": 1.0,
-    "fuel": 1.0
+    "fuel": 0.1
 }
+
 
 
 

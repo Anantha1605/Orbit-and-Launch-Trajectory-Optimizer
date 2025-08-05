@@ -34,7 +34,7 @@ def rotation_matrix(i, raan, arg_of_perigee):
         [
             [1, 0, 0],
             [0, np.cos(-i), -np.sin(-i)],
-            [0, np.cos(-i), np.sin(-i)]
+            [0, np.sin(-i), np.cos(-i)]
         ]
     )
 
@@ -64,7 +64,7 @@ def position_on_orbit(a, e, true_anomaly):
     This system makes orbit math easier, especially for elliptical orbits.
     """
 
-    r = a * (1 + np.power(np.e, 2)) / (1 + np.e * np.cos(true_anomaly))
+    r = a * (1 - np.power(np.e, 2)) / (1 + np.e * np.cos(true_anomaly))
 
     return np.array([
         r * np.cos(true_anomaly),
@@ -166,17 +166,28 @@ class PINN(nn.Module):
         # Building the layers
         for i in range(len(layers)-1):
             self.net.add_module(f"linear{i}", nn.Linear(layers[i], layers[i+1]))
-            if i < len(layers)-2 and layers[i+1]:
+            if i < len(layers)-2:
                 self.net.add_module(f"tanh{i}", nn.Tanh())
 
+        # Output scaling factors (rough estimates)
+        self.scale_r = 1e7  # meters
+        self.scale_v = 1e4  # m/s
+        self.scale_m = 1e6  # kg
+
     def forward(self, t):
-        return self.net(t)
+        x = self.net(t)
+        # Scale output
+        r = x[:, 0:3] * self.scale_r
+        v = x[:, 3:6] * self.scale_v
+        m = x[:, 6:7] * self.scale_m
+        return torch.cat([r, v, m], dim=1)
 
 # Sampling time points
 def sample_time_points(n_points, t_final):
     tensor = torch.linspace(0, t_final, n_points)
     t = tensor.view(-1,1) # defines the tensor into the shape (row, col). row = -1 implies, automatic selection of number of rows
     t.requires_grad_(True) # Enabling automatic differentiation
+    return t
 
 # Function to unpack outputs
 def unpack(output):
@@ -189,7 +200,7 @@ def unpack(output):
 
     return r, v, m
 
-# defining the residual for EOM and other physical contraints
+# defining the residual for EOM and other physical constraints
 def physics_loss(t, model, r, v, m):
     # constants
     from constants import G, M, Isp, g, T
@@ -207,15 +218,17 @@ def physics_loss(t, model, r, v, m):
     a_gravity = - (G*M/norm_r**3) * r # acceleration
 
     # tensor representing a unit thrust direction vector
-    thrust_unit_dir = torch.tensor([0.0, 0.0, 0.1]) # represents thrust pointing in +ve z axis
-    thrust_dir = thrust_unit_dir.to(t.device).reshape(1,3) # move to same device (CPU, GPU) : resize for compatibility
-    a_thrust = (T / m) * thrust_dir
+    thrust_unit_dir = torch.tensor([0.0, 0.0, 0.1], device=t.device)  # represents thrust pointing in +ve z axis
+    thrust_dir = thrust_unit_dir.expand(r.shape[0], -1) # move to same device (CPU, GPU) : resize for compatibility
+    eps = 1e-6  # small epsilon to prevent divide-by-zero
+    safe_m = torch.clamp(m, min=eps)
+    a_thrust = (T / safe_m) * thrust_dir
 
     res_v = dv - a_gravity - a_thrust
 
 
     # residual for mass : (refer 3. of EOM loss)
-    res_m = dm + (T/(Isp*g))
+    res_m = dm + T / (Isp * g)
 
 
     # Mean squared loss
@@ -250,8 +263,14 @@ def fuel_efficiency_loss(predicted_mf, initial_mass):
     predicted_mf: predicted final mass (torch tensor)
     initial_mass: known starting mass (scalar)
     """
-    return torch.mean((initial_mass - predicted_mf)**2)
+    if not isinstance(initial_mass, torch.Tensor):
+        initial_mass_tensor = torch.tensor(initial_mass, dtype=predicted_mf.dtype, device=predicted_mf.device)
+    else:
+        initial_mass_tensor = initial_mass.detach().clone().to(dtype=predicted_mf.dtype, device=predicted_mf.device)
 
+    initial_mass_tensor = initial_mass_tensor.expand_as(predicted_mf)  # Shape match if needed
+
+    return torch.mean((initial_mass_tensor - predicted_mf) ** 2)
 
 
 def total_loss(model, t_phys, t0, tf, r0, v0, m0, r_target):
@@ -291,6 +310,10 @@ def total_loss(model, t_phys, t0, tf, r0, v0, m0, r_target):
     return total
 
 def train(model, epochs, optimizer,t_phys, t0, tf,r0, v0, m0,r_target):
+    import matplotlib
+    matplotlib.use('TkAgg')
+    import matplotlib.pyplot as plt
+    gradient_history = {}
 
     model.train()
 
@@ -301,35 +324,61 @@ def train(model, epochs, optimizer,t_phys, t0, tf,r0, v0, m0,r_target):
                           r0, v0, m0, r_target)
 
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         if epoch % 100 == 0:
             print(f"Epoch {epoch}: Loss = {loss.item():.6f}")
+            """
+            # Printing parameter change for debugging
+            for name, param in model.named_parameters():
+                print(f"{name} , grad norm: {param.grad.norm().item():.6f}")
+            """
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    if name not in gradient_history:
+                        gradient_history[name] = []
+                    gradient_history[name].append(grad_norm)
+
+    # Visualize the gradient norms for each parameter
+    plt.figure(figsize=(12, 6))
+    for name, norms in gradient_history.items():
+        plt.plot(norms, label=name)
+    plt.xlabel('Epoch')
+    plt.ylabel('Gradient Norm')
+    plt.title('Gradient Norms per Parameter during Training')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
 
 if __name__ == "__main__":
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # Model definition
-    model = PINN(layers=[1, 32, 64, 32, 7])  # 1 input (time), 7 outputs
+    model = PINN(layers=[1, 128, 256, 128, 7]).to(device)  # 1 input (time), 7 outputs
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # Time points
-    t0 = torch.tensor([[0.0]], requires_grad=True)
-    tf = torch.tensor([[burn_time]], requires_grad=True)
-    t_phys = torch.linspace(0, burn_time, 100).view(-1, 1)
-    t_phys.requires_grad_(True)
+    t0 = torch.tensor([[0.0]], requires_grad=True, device = device)
+    tf = torch.tensor([[burn_time]], requires_grad=True, device = device)
+    t_phys = sample_time_points(100, burn_time).to(device)
 
     # Initial conditions (from constants)
-    r0 = torch.tensor(convert_to_eci(launch_lat, launch_lon), dtype=torch.float32).view(1, 3)
+    r0 = torch.tensor(convert_to_eci(launch_lat, launch_lon), dtype=torch.float32).view(1, 3).to(device)
     v0 = torch.zeros_like(r0)
-    m0 = torch.tensor([[rocket_mass]], dtype=torch.float32)
+    m0 = torch.tensor([[rocket_mass]], dtype=torch.float32).to(device)
 
     # Target orbit position (using optimal true anomaly)
     nu = compute_optimal_true_anomaly(ORBITAL_ELEMENTS, launch_lat, launch_lon, 0)
-    r_target = torch.tensor(rotation_matrix(i, raan, arg_of_perigee) @ position_on_orbit(a, e, nu),
-                            dtype=torch.float32).view(1, 3)
+    r_target_np = rotation_matrix(i, raan, arg_of_perigee) @ position_on_orbit(a, e, nu)
+    r_target = torch.tensor(r_target_np, dtype=torch.float32).view(1, 3).to(device)
 
     # Train
-    train(model, epochs=5000, optimizer=optimizer,
+    train(model, epochs=1000, optimizer=optimizer,
           t_phys=t_phys, t0=t0, tf=tf,
           r0=r0, v0=v0, m0=m0,
           r_target=r_target)
-
