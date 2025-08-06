@@ -1,8 +1,9 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 from constants import R as earth_radius, earth_rotation_rate, burn_time, launch_lat, launch_lon, rocket_mass, ORBITAL_ELEMENTS,a, i, raan, arg_of_perigee, e
-
+earth_radius = R
 def convert_to_eci(lat, lon, t=0):
     """
     Convert launch site to ECI coordinates at time t. t-> time since epoch
@@ -128,7 +129,7 @@ if __name__ == "__main__":
 
 # PINN design
 """
-Input: time 
+Input: time
 Outputs: position r(x, y, z), velocity v(x, y, z), mass m(t)
 
 Constraints:
@@ -137,7 +138,7 @@ Constraints:
         - r(x, y, z) -> launch site ECI
         - v(x, y, z) -> 0 or launch pad direction
         - m(t) -> initial mass of rocket
-        
+
     Terminal conditions:
     - r(x, y, z) -> r(target)
     - v(x, y, z) -> orbital velocity for altitude
@@ -151,9 +152,9 @@ Constraints:
 2. dv/dt = a{gravity} + a{thrust}
 3. dm/dt = -T(t)/(Isp*g0) -> Isp: Specific impulse
 
-L{total} =  w{EOM} * L{EOM} + 
-            w{initial condition} * L{initial condition} + 
-            w{target} * L{target} + 
+L{total} =  w{EOM} * L{EOM} +
+            w{initial condition} * L{initial condition} +
+            w{target} * L{target} +
             w{fuel} * L{fuel} # Mass depletion rate loss
 """
 
@@ -162,12 +163,17 @@ class PINN(nn.Module):
     def __init__(self, layers):
         super(PINN, self).__init__()
         self.net = nn.Sequential()
-
+        dropout_prob = 0.3  # Example: 30% dropout rate
         # Building the layers
         for i in range(len(layers)-1):
-            self.net.add_module(f"linear{i}", nn.Linear(layers[i], layers[i+1]))
+            linear_layer = nn.Linear(layers[i], layers[i+1])
+            self.net.add_module(f"linear{i}", linear_layer)
+            # Apply Xavier Uniform Initialization to the weights
+            init.xavier_uniform_(linear_layer.weight)
             if i < len(layers)-2:
                 self.net.add_module(f"tanh{i}", nn.Tanh())
+                # add dropout layers
+                self.net.add_module(f"dropout{i}", nn.Dropout(p=dropout_prob))
 
         # Output scaling factors (rough estimates)
         self.scale_r = 1e7  # meters
@@ -316,7 +322,7 @@ def train(model, epochs, optimizer,t_phys, t0, tf,r0, v0, m0,r_target):
     gradient_history = {}
 
     model.train()
-
+    early_stopping = EarlyStopping(patience=10, delta=0.01)
     for epoch in range(epochs):
         optimizer.zero_grad()
 
@@ -334,12 +340,16 @@ def train(model, epochs, optimizer,t_phys, t0, tf,r0, v0, m0,r_target):
             for name, param in model.named_parameters():
                 print(f"{name} , grad norm: {param.grad.norm().item():.6f}")
             """
+            early_stopping(loss, model)
+            if early_stopping.early_stop:
+              break
             for name, param in model.named_parameters():
                 if param.grad is not None:
                     grad_norm = param.grad.norm().item()
                     if name not in gradient_history:
                         gradient_history[name] = []
                     gradient_history[name].append(grad_norm)
+
 
     # Visualize the gradient norms for each parameter
     plt.figure(figsize=(12, 6))
@@ -354,13 +364,43 @@ def train(model, epochs, optimizer,t_phys, t0, tf,r0, v0, m0,r_target):
     plt.show()
 
 
+class EarlyStopping:
+    def __init__(self, patience=5, delta=0):
+        self.patience = patience
+        self.delta = delta
+        self.best_score = None
+        self.early_stop = False
+        self.counter = 0
+        self.best_model_state = None
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+
+        if self.best_score is None:
+            self.best_score = score
+            self.best_model_state = model.state_dict()
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.best_model_state = model.state_dict()
+            self.counter = 0
+
+    def load_best_model(self, model):
+        model.load_state_dict(self.best_model_state)
+
+
 if __name__ == "__main__":
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Model definition
     model = PINN(layers=[1, 128, 256, 128, 7]).to(device)  # 1 input (time), 7 outputs
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    # model = PINN(layers=[1, 32, 7]).to(device)  # Decrease the number of Hidden layes, does not work
+    # optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2) # increase learning rate
 
     # Time points
     t0 = torch.tensor([[0.0]], requires_grad=True, device = device)
@@ -378,7 +418,7 @@ if __name__ == "__main__":
     r_target = torch.tensor(r_target_np, dtype=torch.float32).view(1, 3).to(device)
 
     # Train
-    train(model, epochs=1000, optimizer=optimizer,
+    train(model, epochs=5000, optimizer=optimizer,
           t_phys=t_phys, t0=t0, tf=tf,
           r0=r0, v0=v0, m0=m0,
           r_target=r_target)
