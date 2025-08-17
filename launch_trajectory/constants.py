@@ -63,13 +63,9 @@ burn_time = rocket_mass / mdot  # seconds (approx)
 
 # Weights [physics, initial, terminal, fuel efficiency]
 weights = {
-    "phys": 10.0,
-    "init": 1.0,
-    "term": 1.0,
-    "fuel": 0.1
+    "phys": 5.0,
+    "init": 10.0,
+    "term": 10.0,
+    "fuel": 5.0
 }
-
-
-
-
-
+loss_threshold = 100 # absolute maximum value of loss function for early stopping the model.
