@@ -175,19 +175,27 @@ class PINN(nn.Module):
         for i in range(len(layers) - 1):
             linear_layer = nn.Linear(layers[i], layers[i + 1])
             self.net.add_module(f"linear{i}", linear_layer)
+
             # Apply Xavier Uniform Initialization to the weights
             init.xavier_uniform_(linear_layer.weight)
             # Apply Orthogonal Initialization to the weights
             # init.orthogonal_(linear_layer.weight)
+
+            # Custom small-value initialization for weights
+            #init.constant_(linear_layer.weight, 1e-2) # constant initialization
+
+            # initialize the bias -> initializing with all 0's
+            #nn.init.zeros_(linear_layer.bias)
+
             if i < len(layers) - 2:
                 self.net.add_module(f"softsign{i}", nn.Softsign())
                 # add dropout layers
                 self.net.add_module(f"dropout{i}", nn.Dropout(p=dropout_prob))
 
-        # Output scaling factors (rough estimates)
-        self.scale_r = 1e7  # meters
-        self.scale_v = 7e3  # m/s
-        self.scale_m = 1e6  # kg
+
+        self.scale_r = 7e6  # ~Earth radius + typical orbital altitude
+        self.scale_v = 8e3  # Slightly above orbital velocity
+        self.scale_m = 1e5  # 500 tons max (adjust to your rocket_mass)
 
     def forward(self, t):
         # network predicts normalized outputs in [-1, 1]
@@ -217,6 +225,47 @@ def unpack(output):
     m = output[:, 6:7]  # mass (m)| Shape: (batch, 1)
 
     return r, v, m
+
+# physics-based thrust direction initialization
+def gravity_turn_thrust_direction(r, v, t_norm, burn_time):
+    """
+    Physics-based gravity turn - gradually tilts from vertical to horizontal.
+    Ensures output shape is [N, 3] for compatibility with downstream code.
+    """
+    # Convert normalized time to physical time
+    t_phys = t_norm * burn_time
+
+    # Gravity turn parameters
+    turn_start = 10.0  # Start turn after 10 seconds
+    turn_duration = 60.0  # Complete turn over 60 seconds
+
+    # Calculate turn angle (0 = vertical, π/2 = horizontal)
+    turn_progress = torch.clamp((t_phys - turn_start) / turn_duration, 0, 1)
+    pitch_angle = turn_progress * (torch.pi / 2)
+
+    # Local coordinate system
+    r_norm = torch.norm(r, dim=1, keepdim=True)
+    r_unit = r / (r_norm + 1e-8)  # Radial unit vector (up)
+
+    if r.shape[1] == 3:
+        # 3D case
+        z_axis = torch.tensor([0., 0., 1.], device=r.device).expand_as(r)
+        tangent = torch.cross(z_axis, r_unit, dim=1)
+        tangent_norm = torch.norm(tangent, dim=1, keepdim=True)
+        tangent_unit = tangent / (tangent_norm + 1e-8)
+    else:
+        # 2D case
+        tangent_unit = torch.stack([-r_unit[:, 1], r_unit[:, 0]], dim=1)
+
+        # Pad r_unit and tangent_unit to 3D
+        r_unit = torch.cat([r_unit, torch.zeros(r_unit.size(0), 1, device=r.device)], dim=1)
+        tangent_unit = torch.cat([tangent_unit, torch.zeros(tangent_unit.size(0), 1, device=r.device)], dim=1)
+
+    # Combine radial and tangential components
+    thrust_dir = (torch.cos(pitch_angle).unsqueeze(-1) * r_unit +
+                  torch.sin(pitch_angle).unsqueeze(-1) * tangent_unit)
+
+    return thrust_dir  # Always shape [N, 3]
 
 # defining the residual for EOM and other physical constraints
 def physics_loss(t_norm, r_phys, v_phys, m_phys, scale_r, scale_v, scale_m):
@@ -251,8 +300,9 @@ def physics_loss(t_norm, r_phys, v_phys, m_phys, scale_r, scale_v, scale_m):
     a_gravity = -(G * M / (safe_norm_r ** 3)) * r  # acceleration
 
     # tensor representing a unit thrust direction vector
-    thrust_unit_dir = torch.tensor([0.0, 0.0, 0.1], device=t_norm.device)  # represents thrust pointing in +ve z axis
-    thrust_dir = thrust_unit_dir.unsqueeze(0).expand(r.shape[0], -1)  # move to same device (CPU, GPU) : resize for compatibility
+    thrust_unit_dir = gravity_turn_thrust_direction(r, v, t_norm, burn_time)
+    #thrust_unit_dir = torch.tensor(thrust_unit_dir, device=t_norm.device)  # represents thrust
+    thrust_dir = thrust_unit_dir  # move to same device (CPU, GPU) : resize for compatibility
     eps = 1e-6  # small epsilon to prevent divide-by-zero
     safe_m = torch.clamp(m, min=eps)
     a_thrust = (T / safe_m) * thrust_dir
@@ -273,7 +323,12 @@ def physics_loss(t_norm, r_phys, v_phys, m_phys, scale_r, scale_v, scale_m):
     loss_v = torch.mean(res_v ** 2)
     loss_m = torch.mean(res_m ** 2)
 
-    return loss_r + loss_v + loss_m + beta * pos_dm_penalty
+    # Normalize each loss component
+    loss_r_norm = loss_r / (model.scale_r ** 2)
+    loss_v_norm = loss_v / (model.scale_v ** 2)
+    loss_m_norm = loss_m / (model.scale_m ** 2)
+
+    return loss_r_norm + loss_v_norm + loss_m_norm + beta * pos_dm_penalty
 
 
 # initial and final condition loss (refer PINN design)
@@ -286,52 +341,57 @@ def initial_loss(model, t0, r0, v0, m0, pred_r, pred_v, pred_m):
     loss_v = torch.mean((v_pred - v0) ** 2)
     loss_m = torch.mean((m_pred - m0) ** 2)
 
-    return loss_r + loss_v + loss_m
+    # Normalize each loss component
+    loss_r_norm = loss_r / (model.scale_r ** 2)
+    loss_v_norm = loss_v / (model.scale_v ** 2)
+    loss_m_norm = loss_m / (model.scale_m ** 2)
+
+    return loss_r_norm + loss_v_norm + loss_m_norm
 
 
 def terminal_loss(model, tf, r_target, pred_r, pred_v):
-    from constants import orbital_velocity
-    # mandating orbital_velocity is tensor with correct shape
+    """
+    Fixed terminal loss for circular LEO orbits
+    """
+    from constants import G, M  # Make sure these are defined in constants.py
 
-    # Scale predictions to physical units (keeping original variable names for compatibility)
+    # Scale predictions to physical units
     r_pred_physical = pred_r * model.scale_r
+    v_pred_physical = pred_v * model.scale_v
 
-    if isinstance(orbital_velocity, (int, float)):
-        # For circular orbit, velocity is tangential to position
-        r_norm = torch.norm(r_pred_physical, dim=1, keepdim=True)
+    # Calculate target orbital velocity for circular orbit
+    r_target_norm = torch.norm(r_target, dim=1, keepdim=True)
+    v_orbital_magnitude = torch.sqrt(G * M / r_target_norm)  # Circular orbital velocity
 
-        # Calculate tangential velocity direction (perpendicular to radius)
-        if r_pred_physical.shape[1] == 2:
-            # 2D case: tangent = [-y, x] / |r|
-            tangent_unit = torch.stack([
-                -r_pred_physical[:, 1],
-                r_pred_physical[:, 0]
-            ], dim=1) / r_norm
-        else:
-            # 3D case - assume orbit in xy-plane
-            tangent_unit = torch.stack([
-                -r_pred_physical[:, 1],
-                r_pred_physical[:, 0],
-                torch.zeros_like(r_pred_physical[:, 2])
-            ], dim=1) / r_norm
+    # Calculate tangential velocity direction (perpendicular to position)
+    # For 3D case, assume orbital plane is approximately xy-plane
+    r_target_unit = r_target / (r_target_norm + 1e-8)
 
-        # Create tangential velocity with specified magnitude
-        v_target = orbital_velocity * tangent_unit
-
+    if r_target.shape[1] == 3:
+        # Create tangential direction in orbital plane
+        # Assuming orbit in xy-plane, tangent = [-y, x, 0] normalized
+        tangent_raw = torch.stack([
+            -r_target[:, 1],
+            r_target[:, 0],
+            torch.zeros_like(r_target[:, 2])
+        ], dim=1)
+        tangent_norm = torch.norm(tangent_raw, dim=1, keepdim=True)
+        tangent_unit = tangent_raw / (tangent_norm + 1e-8)
     else:
-        # if already vector
-        v_target = torch.tensor(orbital_velocity, dtype=pred_v.dtype, device=pred_v.device)
-        if v_target.dim() == 1:
-            v_target = v_target.unsqueeze(0)
+        # 2D case
+        tangent_unit = torch.stack([
+            -r_target_unit[:, 1],
+            r_target_unit[:, 0]
+        ], dim=1)
 
-    # Keep original variable names for compatibility
-    r_pred = r_pred_physical  # Now contains the full position vector, not just magnitude
-    v_pred = pred_v * model.scale_v
+    # Target velocity vector (tangential with orbital magnitude)
+    v_target = v_orbital_magnitude * tangent_unit
 
-    loss_r = torch.mean((r_pred - r_target) ** 2)
-    loss_v = torch.mean((v_pred - v_target) ** 2)
+    # Compute losses with proper scaling
+    loss_r = torch.mean(((r_pred_physical - r_target) / model.scale_r) ** 2)
+    loss_v = torch.mean(((v_pred_physical - v_target) / model.scale_v) ** 2)
+
     return loss_r + loss_v
-
 
 def fuel_efficiency_loss(predicted_mf_phys, initial_mass, model):
     """
@@ -429,8 +489,23 @@ def train(model, epochs, optimizer, scheduler, t_phys, t0, tf, r0, v0, m0, r_tar
 
         loss.backward()
 
-        # gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+        # Adaptive gradient clipping
+        if epoch < 1000:
+            max_norm = 0.5
+        elif epoch < 5000:
+            max_norm = 0.2
+        else:
+            max_norm = 0.1
+
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+
+        # Optional: Scale gradients for boundary conditions
+        if epoch > 1000:
+            for name, param in model.named_parameters():
+                if param.grad is not None and any(layer in name for layer in ['net.4', 'net.5', 'net.6']):
+                    param.grad *= 2.0  # Emphasize boundary conditions in later layers
+
+
         optimizer.step()
 
         # Stepping the scheduler, so it adapts the LR if loss plateaus
@@ -713,7 +788,7 @@ if __name__ == "__main__":
 
     # Training the model
     try:
-        train(model, epochs=100000, optimizer=optimizer, scheduler=scheduler,
+        train(model, epochs=2000, optimizer=optimizer, scheduler=scheduler,
               t_phys=t_phys, t0=t0, tf=tf,
               r0=r0, v0=v0, m0=m0,
               r_target=r_target)

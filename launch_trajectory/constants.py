@@ -68,4 +68,9 @@ weights = {
     "term": 10.0,
     "fuel": 5.0
 }
-loss_threshold = 100 # absolute maximum value of loss function for early stopping the model.
+loss_normalization_constant = 1e10
+absolute_loss_max = 1e2 # absolute maximum value of loss function for early stopping the model.
+loss_threshold = absolute_loss_max / loss_normalization_constant
+
+print("\nLoss threshold: ", loss_threshold)
+print("\n")
