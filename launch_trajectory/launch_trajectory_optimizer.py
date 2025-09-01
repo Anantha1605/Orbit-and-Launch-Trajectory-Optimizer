@@ -6,8 +6,9 @@ import copy
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
-from constants import R, earth_rotation_rate, burn_time, launch_lat, launch_lon, rocket_mass, \
-    ORBITAL_ELEMENTS, a, i, raan, arg_of_perigee, e
+from constants import R, earth_rotation_rate, burn_time, launch_lat, launch_lon, fuel_mass, \
+    ORBITAL_ELEMENTS, a, i, raan, arg_of_perigee, e, orbital_velocity, Isp, g, v_ground, \
+    v0_eci_tensor, r0_eci_tensor, weights, individual_loss_threshold, phys_scale, init_scale, fuel_scale, term_scale
 
 earth_radius = R
 def convert_to_eci(lat, lon, t=0):
@@ -24,7 +25,7 @@ def convert_to_eci(lat, lon, t=0):
     y = earth_radius * np.cos(lat) * np.sin(theta)
     z = earth_radius * np.sin(lat)
 
-    return np.array([x, y, z], dtype=np.float64)
+    return np.array([x, y, z], dtype=np.float32)
 
 def rotation_matrix(i, raan, arg_of_perigee):
     # 3 - 1 - 3 Euler rotation matrix -> sequence of rotations about the z-axis, then the x-axis, then again the z-axis.
@@ -110,28 +111,6 @@ def compute_optimal_true_anomaly(orbital_elements, launch_lat, launch_lon, t_lau
 
     return best_nu
 
-
-# Trial code -> remove at last
-"""
-if __name__ == "__main__":
-    from constants import ORBITAL_ELEMENTS, launch_lon, launch_lat
-    from datetime import datetime
-    from astropy.time import Time
-
-    # Get current time (or time of launch)
-    t = datetime.now()
-
-    # Convert to seconds since J2000 using astropy
-    j2000_epoch = datetime(2000, 1, 1, 12, 0, 0)  # J2000 epoch
-    time_difference = t - j2000_epoch  # Calculate time difference
-    t_launch_seconds = time_difference.total_seconds()  # Convert to seconds
-
-    # Now pass the numeric value (t_launch_seconds) to your function
-    nu = compute_optimal_true_anomaly(ORBITAL_ELEMENTS, launch_lat, launch_lon, t_launch_seconds)
-
-    print("Optimal true anomaly:", nu)
-"""
-
 # PINN design
 """
 Input: time 
@@ -163,31 +142,36 @@ L{total} =  w{EOM} * L{EOM} +
             w{fuel} * L{fuel} # Mass depletion rate loss
 """
 
-
 # Defining the NN
 class PINN(nn.Module):
     def __init__(self, layers):
         super(PINN, self).__init__()
         self.net = nn.Sequential()
-        dropout_prob = 0.1  # Example: 10% dropout rate
+        dropout_prob = 0.001  # Example: 0.1% dropout rate
 
         # Building the layers
         for i in range(len(layers) - 1):
             linear_layer = nn.Linear(layers[i], layers[i + 1])
             self.net.add_module(f"linear{i}", linear_layer)
-            # Apply Xavier Uniform Initialization to the weights
-            init.xavier_uniform_(linear_layer.weight)
+
+            # Apply Xavier Normal Initialization to the weights
+            gain = 1.0
+            init.xavier_normal_(tensor=linear_layer.weight, gain=gain)
             # Apply Orthogonal Initialization to the weights
             # init.orthogonal_(linear_layer.weight)
+
+
+            # initialize the bias -> initializing with all 0's
+            # nn.init.zeros_(linear_layer.bias)
+
             if i < len(layers) - 2:
                 self.net.add_module(f"softsign{i}", nn.Softsign())
                 # add dropout layers
                 self.net.add_module(f"dropout{i}", nn.Dropout(p=dropout_prob))
 
-        # Output scaling factors (rough estimates)
-        self.scale_r = 1e7  # meters
-        self.scale_v = 7e3  # m/s
-        self.scale_m = 1e6  # kg
+        self.scale_r = 7.28e6   # Earth + 400km + margin
+        self.scale_v = 9.5e3    # 1.2x orbital velocity
+        self.scale_m = 549000   # Actual rocket mass
 
     def forward(self, t):
         # network predicts normalized outputs in [-1, 1]
@@ -198,7 +182,6 @@ class PINN(nn.Module):
         x = self.net(t) # t is normalized [0,1]
 
         return x
-
 
 # Sampling time points
 def sample_time_points(n_points):
@@ -217,6 +200,47 @@ def unpack(output):
     m = output[:, 6:7]  # mass (m)| Shape: (batch, 1)
 
     return r, v, m
+
+# physics-based thrust direction initialization
+def gravity_turn_thrust_direction(r, v, t_norm, burn_time):
+    """
+    Physics-based gravity turn - gradually tilts from vertical to horizontal.
+    Ensures output shape is [N, 3] for compatibility with downstream code.
+    """
+    # Convert normalized time to physical time
+    t_phys = t_norm * burn_time
+
+    # Gravity turn parameters
+    turn_start = 10.0  # Start turn after 10 seconds
+    turn_duration = 60.0  # Complete turn over 60 seconds
+
+    # Calculate turn angle (0 = vertical, π/2 = horizontal)
+    turn_progress = torch.clamp((t_phys - turn_start) / turn_duration, 0, 1)
+    pitch_angle = turn_progress * (torch.pi / 2)
+
+    # Local coordinate system
+    r_norm = torch.norm(r, dim=1, keepdim=True)
+    r_unit = r / (r_norm + 1e-8)  # Radial unit vector (up)
+
+    if r.shape[1] == 3:
+        # 3D case
+        z_axis = torch.tensor([0., 0., 1.], device=r.device).expand_as(r)
+        tangent = torch.cross(z_axis, r_unit, dim=1)
+        tangent_norm = torch.norm(tangent, dim=1, keepdim=True)
+        tangent_unit = tangent / (tangent_norm + 1e-8)
+    else:
+        # 2D case
+        tangent_unit = torch.stack([-r_unit[:, 1], r_unit[:, 0]], dim=1)
+
+        # Pad r_unit and tangent_unit to 3D
+        r_unit = torch.cat([r_unit, torch.zeros(r_unit.size(0), 1, device=r.device)], dim=1)
+        tangent_unit = torch.cat([tangent_unit, torch.zeros(tangent_unit.size(0), 1, device=r.device)], dim=1)
+
+    # Combine radial and tangential components
+    thrust_dir = (torch.cos(pitch_angle).unsqueeze(-1) * r_unit +
+                  torch.sin(pitch_angle).unsqueeze(-1) * tangent_unit)
+
+    return thrust_dir  # Always shape [N, 3]
 
 # defining the residual for EOM and other physical constraints
 def physics_loss(t_norm, r_phys, v_phys, m_phys, scale_r, scale_v, scale_m):
@@ -251,8 +275,9 @@ def physics_loss(t_norm, r_phys, v_phys, m_phys, scale_r, scale_v, scale_m):
     a_gravity = -(G * M / (safe_norm_r ** 3)) * r  # acceleration
 
     # tensor representing a unit thrust direction vector
-    thrust_unit_dir = torch.tensor([0.0, 0.0, 0.1], device=t_norm.device)  # represents thrust pointing in +ve z axis
-    thrust_dir = thrust_unit_dir.unsqueeze(0).expand(r.shape[0], -1)  # move to same device (CPU, GPU) : resize for compatibility
+    thrust_unit_dir = gravity_turn_thrust_direction(r, v, t_norm, burn_time)
+    #thrust_unit_dir = torch.tensor(thrust_unit_dir, device=t_norm.device)  # represents thrust
+    thrust_dir = thrust_unit_dir  # move to same device (CPU, GPU) : resize for compatibility
     eps = 1e-6  # small epsilon to prevent divide-by-zero
     safe_m = torch.clamp(m, min=eps)
     a_thrust = (T / safe_m) * thrust_dir
@@ -273,80 +298,107 @@ def physics_loss(t_norm, r_phys, v_phys, m_phys, scale_r, scale_v, scale_m):
     loss_v = torch.mean(res_v ** 2)
     loss_m = torch.mean(res_m ** 2)
 
-    return loss_r + loss_v + loss_m + beta * pos_dm_penalty
+    # Normalize each loss component
+    loss_r_norm = loss_r / (scale_r ** 2)
+    loss_v_norm = loss_v / (scale_v ** 2)
+    loss_m_norm = loss_m / (scale_m ** 2)
+
+    return loss_r_norm + loss_v_norm + loss_m_norm + beta * pos_dm_penalty
 
 
 # initial and final condition loss (refer PINN design)
 def initial_loss(model, t0, r0, v0, m0, pred_r, pred_v, pred_m):
     r_pred = pred_r * model.scale_r
     v_pred = pred_v * model.scale_v
-    m_pred = pred_m * model.scale_m
+    # m_pred = abs(pred_m) * model.scale_m -> abs() can cause gradient issues
+
+    m_pred = torch.clamp(pred_m, min=0) * model.scale_m  # Use clamp instead
 
     loss_r = torch.mean((r_pred - r0) ** 2)
     loss_v = torch.mean((v_pred - v0) ** 2)
     loss_m = torch.mean((m_pred - m0) ** 2)
 
-    return loss_r + loss_v + loss_m
+    # Normalize each loss component
+    loss_r_norm = loss_r / (model.scale_r ** 2)
+    loss_v_norm = loss_v / (model.scale_v ** 2)
+    loss_m_norm = loss_m / (model.scale_m ** 2)
+
+    return loss_r_norm + loss_v_norm + loss_m_norm
 
 
 def terminal_loss(model, tf, r_target, pred_r, pred_v):
-    from constants import orbital_velocity
-    # mandating orbital_velocity is tensor with correct shape
+    """
+    Fixed terminal loss for circular LEO orbits
+    Normalized relative to orbital radius to allow stable training
+    """
+    from constants import G, M, a  # Use semi-major axis for normalization
 
-    # Scale predictions to physical units (keeping original variable names for compatibility)
+    # Scale predictions to physical units
     r_pred_physical = pred_r * model.scale_r
+    v_pred_physical = pred_v * model.scale_v
 
-    if isinstance(orbital_velocity, (int, float)):
-        # For circular orbit, velocity is tangential to position
-        r_norm = torch.norm(r_pred_physical, dim=1, keepdim=True)
+    # Calculate target orbital velocity for circular orbit
+    r_target_norm = torch.norm(r_target, dim=1, keepdim=True)
+    v_orbital_magnitude = torch.sqrt(G * M / r_target_norm)  # Circular orbital velocity
 
-        # Calculate tangential velocity direction (perpendicular to radius)
-        if r_pred_physical.shape[1] == 2:
-            # 2D case: tangent = [-y, x] / |r|
-            tangent_unit = torch.stack([
-                -r_pred_physical[:, 1],
-                r_pred_physical[:, 0]
-            ], dim=1) / r_norm
-        else:
-            # 3D case - assume orbit in xy-plane
-            tangent_unit = torch.stack([
-                -r_pred_physical[:, 1],
-                r_pred_physical[:, 0],
-                torch.zeros_like(r_pred_physical[:, 2])
-            ], dim=1) / r_norm
+    # Tangential velocity direction (perpendicular to position)
+    r_target_unit = r_target / (r_target_norm + 1e-8)
 
-        # Create tangential velocity with specified magnitude
-        v_target = orbital_velocity * tangent_unit
-
+    if r_target.shape[1] == 3:
+        tangent_raw = torch.stack([
+            -r_target[:, 1],
+            r_target[:, 0],
+            torch.zeros_like(r_target[:, 2])
+        ], dim=1)
+        tangent_norm = torch.norm(tangent_raw, dim=1, keepdim=True)
+        tangent_unit = tangent_raw / (tangent_norm + 1e-8)
     else:
-        # if already vector
-        v_target = torch.tensor(orbital_velocity, dtype=pred_v.dtype, device=pred_v.device)
-        if v_target.dim() == 1:
-            v_target = v_target.unsqueeze(0)
+        tangent_unit = torch.stack([
+            -r_target_unit[:, 1],
+            r_target_unit[:, 0]
+        ], dim=1)
 
-    # Keep original variable names for compatibility
-    r_pred = r_pred_physical  # Now contains the full position vector, not just magnitude
-    v_pred = pred_v * model.scale_v
+    # Target velocity vector
+    v_target = v_orbital_magnitude * tangent_unit
 
-    loss_r = torch.mean((r_pred - r_target) ** 2)
-    loss_v = torch.mean((v_pred - v_target) ** 2)
+    # ---- Normalized losses ----
+    # Use orbital radius (a) for scaling, instead of absolute meters
+    loss_r = torch.mean(((r_pred_physical - r_target) / a) ** 2)
+    loss_v = torch.mean(((v_pred_physical - v_target) / v_orbital_magnitude) ** 2)
+
     return loss_r + loss_v
-
 
 def fuel_efficiency_loss(predicted_mf_phys, initial_mass, model):
     """
-    Encourage the network to use minimal fuel
-    predicted_mf: predicted final mass (torch tensor)
-    initial_mass: known starting mass (scalar)
+    Physics-based fuel consumption loss using rocket equation
+    Drop-in replacement that enforces realistic fuel consumption
+
+    predicted_mf_phys: predicted final mass (torch tensor, normalized)
+    initial_mass: known starting mass (scalar or tensor)
+    model: model with scale_m attribute for denormalization
     """
-    alpha = 1e3
+
+    # Import constants (assuming constants.py is in same directory)
+
+    # Calculate target velocity (delta-v) from orbital mechanics
+    # For circular orbit: v_orbital = sqrt(GM/r)
+    # Ground velocity component from Earth rotation: v_ground = ω*R*cos(lat) ≈ 464 m/s at equator
+    ground_velocity = v_ground  # m/s, approximate rotational velocity at launch latitude
+    target_velocity = orbital_velocity - ground_velocity  # Net delta-v needed
+
+    specific_impulse = Isp  # Use from constants
+    g0 = g  # Use from constants
+
+    # Denormalize predicted final mass
     predicted_mf = predicted_mf_phys * model.scale_m
+
+    # Convert initial_mass to tensor and match dimensions (same as original)
     if not isinstance(initial_mass, torch.Tensor):
         initial_mass_tensor = torch.tensor(initial_mass, dtype=predicted_mf.dtype, device=predicted_mf.device)
     else:
         initial_mass_tensor = initial_mass.detach().clone().to(dtype=predicted_mf.dtype, device=predicted_mf.device)
 
-    # Reshape to match predicted_mf
+    # Reshape to match predicted_mf (same as original)
     if initial_mass_tensor.dim() == 0:
         initial_mass_tensor = initial_mass_tensor.unsqueeze(0).unsqueeze(0)
     elif initial_mass_tensor.dim() == 1:
@@ -354,17 +406,35 @@ def fuel_efficiency_loss(predicted_mf_phys, initial_mass, model):
 
     initial_mass_tensor = initial_mass_tensor.expand_as(predicted_mf)
 
-    # Minimize fuel usage (maximize final mass)
-    # symmetric MSE (keep if you want)
-    base = torch.mean((initial_mass_tensor - predicted_mf) ** 2)
+    # Calculate physics-based target final mass using rocket equation
+    # m_final = m_initial / exp(Δv / v_exhaust)
+    ve = specific_impulse * g0  # exhaust velocity
+    ideal_mass_ratio = np.exp(target_velocity / ve)  # ~7.4 for LEO
+    target_final_mass = initial_mass_tensor / ideal_mass_ratio
 
-    # add asymmetric penalty: penalize predicted_mf > initial_mass heavily
-    extra = torch.mean(torch.relu(predicted_mf - initial_mass_tensor) ** 2)
+    # PRIMARY LOSS: Encourage realistic fuel consumption
+    # Penalize deviation from physics-based target
+    physics_loss = torch.mean(((predicted_mf - target_final_mass)/model.scale_m) ** 2)
 
-    return base + alpha * extra
+    # CONSTRAINT PENALTIES: Enforce physical bounds
+    alpha = 1e2  # Keep same penalty weight as original
 
+    # Heavily penalize impossible scenarios
+    impossible_penalty = torch.mean(torch.relu(predicted_mf - initial_mass_tensor) ** 2) / (model.scale_m ** 2)  # mf > m0
 
-def total_loss(model, t_phys, t0, tf, r0, v0, m0, r_target):
+    # Penalize unrealistic dry mass (< 5% or > 50% of initial mass)
+    min_realistic_mass = 0.05 * initial_mass_tensor
+    max_realistic_mass = 0.50 * initial_mass_tensor
+
+    too_light_penalty = torch.mean(torch.relu(min_realistic_mass - predicted_mf) ** 2) / (model.scale_m ** 2)
+    insufficient_fuel_penalty = torch.mean(torch.relu(predicted_mf - max_realistic_mass) ** 2) / (model.scale_m ** 2)
+
+    # Combine all penalties (same structure as original)
+    constraint_penalties = impossible_penalty + too_light_penalty + insufficient_fuel_penalty
+
+    return physics_loss + alpha * constraint_penalties
+
+def total_loss(model, t_phys, t0, tf, r0, v0, m0, r_target, epoch):
     """
     t_phys : time points for physics loss (interior of domain)
     t0     : initial time (usually 0), shape (1, 1)
@@ -374,8 +444,6 @@ def total_loss(model, t_phys, t0, tf, r0, v0, m0, r_target):
     weights    : dict with weights for each loss component
     """
 
-    # weights
-    from constants import weights, loss_normalization_constant
 
     # Predict outputs
     out_phys = model(t_phys)
@@ -392,16 +460,20 @@ def total_loss(model, t_phys, t0, tf, r0, v0, m0, r_target):
     loss_term = terminal_loss(model, tf, r_target, r_final, v_final)
     loss_fuel = fuel_efficiency_loss(m_final, m0, model)
 
+    # Scaled
+    norm_phys = loss_phys / phys_scale
+    norm_init = loss_init / init_scale
+    norm_term = loss_term / term_scale
+    norm_fuel = loss_fuel / fuel_scale
+
     # Weighted total loss
-    total = (weights["phys"] * loss_phys +
-             weights["init"] * loss_init +
-             weights["term"] * loss_term +
-             weights["fuel"] * loss_fuel)
+    total = (weights['phys'] * norm_phys +
+                  weights['init'] * norm_init +
+                  weights['term'] * norm_term +
+                  weights['fuel'] * norm_fuel)
 
-    # Normalizing the total value for better updates
-    normalized_total = total / loss_normalization_constant
 
-    return normalized_total, {
+    return total, {
         "physics": loss_phys.item(),
         "initial": loss_init.item(),
         "terminal": loss_term.item(),
@@ -410,27 +482,40 @@ def total_loss(model, t_phys, t0, tf, r0, v0, m0, r_target):
 
 
 def train(model, epochs, optimizer, scheduler, t_phys, t0, tf, r0, v0, m0, r_target):
-    import matplotlib
-    matplotlib.use('TkAgg')
-    import matplotlib.pyplot as plt
-    from constants import loss_threshold
 
     gradient_history = {}
     loss_history = []
 
     model.train()
 
-    relocation = Relocation(patience=10)
+    relocation = Relocation(patience=300)
 
     for epoch in range(epochs):
         optimizer.zero_grad()
 
-        loss, loss_breakdown = total_loss(model, t_phys, t0, tf, r0, v0, m0, r_target)
+        loss, loss_breakdown = total_loss(model, t_phys, t0, tf, r0, v0, m0, r_target, epoch)
 
         loss.backward()
 
-        # gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+        # Adaptive gradient clipping
+        """
+        if epoch < 1000:
+            max_norm = 0.5
+        elif epoch < 5000:
+            max_norm = 0.2
+        else:
+            max_norm = 0.1
+        """
+        max_norm = min(1.0, 1.0 / (1 + epoch * 0.0001))  # decays smoothly
+
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+
+        # Optional: Scale gradients for boundary conditions
+        if epoch > 1000:
+            for name, param in model.named_parameters():
+                if param.grad is not None and any(layer in name for layer in ['net.4', 'net.5', 'net.6']):
+                    param.grad *= 2.0  # Emphasize boundary conditions in later layers
+
         optimizer.step()
 
         # Stepping the scheduler, so it adapts the LR if loss plateaus
@@ -440,9 +525,10 @@ def train(model, epochs, optimizer, scheduler, t_phys, t0, tf, r0, v0, m0, r_tar
         loss_history.append(loss.item())
 
         if epoch % 100 == 0:
-            print(f"Epoch {epoch}: Loss = {loss.item():.6f}")
-            # print(f"  Physics: {loss_breakdown['physics']:.6f}, Initial: {loss_breakdown['initial']:.6f}")
-            # print(f"  Terminal: {loss_breakdown['terminal']:.6f}, Fuel: {loss_breakdown['fuel']:.6f}")
+            print(f"Epoch {epoch}: Loss = {loss.item():.8f}")
+            print(f"  Physics: {loss_breakdown['physics']:.6f}, Initial: {loss_breakdown['initial']:.6f}")
+            print(f"  Terminal: {loss_breakdown['terminal']:.6f}, Fuel: {loss_breakdown['fuel']:.6f}")
+            print("\n")
 
             relocation(loss, model)
             if relocation.change_done:
@@ -456,8 +542,14 @@ def train(model, epochs, optimizer, scheduler, t_phys, t0, tf, r0, v0, m0, r_tar
                     gradient_history[name].append(grad_norm)
 
         # Stop if loss below threshold {Early stopping}
-        if loss.item() <= loss_threshold:
-            print(f"\n Loss target reached: {loss.item():.6f} at epoch {epoch}")
+        # Early stopping based on individual component losses
+        if (loss_breakdown["physics"] <= individual_loss_threshold * phys_scale and
+                loss_breakdown["initial"] <= individual_loss_threshold * init_scale and
+                loss_breakdown["terminal"] <= individual_loss_threshold * term_scale and
+                loss_breakdown["fuel"] <= individual_loss_threshold * fuel_scale):
+            print(f"\nEarly stopping: All critical losses below threshold at epoch {epoch}")
+            print(
+                f"Physics: {loss_breakdown['physics']:.6f}, Initial: {loss_breakdown['initial']:.6f}, Terminal: {loss_breakdown['terminal']:.6f} , Fuel: {loss_breakdown['fuel']:.6f}")
             break
 
     # plotting results
@@ -484,54 +576,9 @@ def train(model, epochs, optimizer, scheduler, t_phys, t0, tf, r0, v0, m0, r_tar
     plt.tight_layout()
     plt.show()
 
-"""
+
 class Relocation:
-    def __init__(self, patience=5, delta_improvement=3e-10):
-        self.patience = patience
-        self.delta_improvement = delta_improvement  # relative factor
-        self.best_score = None
-        self.counter = 0
-        self.best_model_state = None
-        self.change_done = False
-
-    def __call__(self, val_loss, model):
-        score = -val_loss
-
-        # First time — set baseline
-        if self.best_score is None:
-            self.best_score = score
-            self.best_model_state = copy.deepcopy(model.state_dict())
-            self.counter = 0
-            return
-
-        if score == "inf":
-            self.counter += 1
-            if self.counter >= self.patience:
-                model.load_state_dict(self.best_model_state)
-                self.counter = 0
-                self.change_done = True
-
-        # Compute delta dynamically relative to current best
-        delta = self.delta_improvement * abs(self.best_score)
-
-        # Improvement
-        if score > self.best_score + delta:
-            self.best_score = score
-            self.best_model_state = copy.deepcopy(model.state_dict())
-            self.counter = 0
-            self.change_done = False  # reset flag
-        else:
-            # No improvement
-            self.counter += 1
-            if self.counter >= self.patience:
-                model.load_state_dict(self.best_model_state)
-                self.counter = 0
-                self.change_done = True
-
-
-"""
-class Relocation:
-    def __init__(self, patience=5):
+    def __init__(self, patience=500):
         self.patience = patience
         self.improvement = 1
         self.best_score = None
@@ -547,16 +594,18 @@ class Relocation:
             self.best_score = score
             self.best_model_state = copy.deepcopy(model.state_dict())
             self.counter = 0
+            self.improvement = 0.3 * self.best_score
             return
 
         # Improvement
-        if score > self.best_score:
+        if score > self.best_score + self.improvement:
             self.best_score = score
             self.best_model_state = copy.deepcopy(model.state_dict())
             self.counter = 0
             self.change_done = False  # reset flag
 
         else:
+            # Relocate
             self.counter += 1
             if self.counter >= self.patience:
                 model.load_state_dict(self.best_model_state)
@@ -660,22 +709,16 @@ def save_trajectory_data(trajectory_data, filename='trajectory_collocation_point
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {device}\n")
 
     # Model definition
     model = PINN(layers=[1, 128, 256, 64, 256, 128, 7]).to(device)  # 1 input (time), 7 outputs
-    """
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=1e-3,
-        weight_decay=1e-3,
-        betas=(0.95, 0.999)
-    )
-    """
+
     # Trying out the AdamW optimizer with modified hyperparameters, in place of the standard Adam Optimizer
     optimizer = torch.optim.AdamW(
         params=model.parameters(),
-        lr = 1e-4,
-        betas = (0.95, 0.999),
+        lr = 1e-5,
+        betas = (0.97, 0.999),
         eps = 1e-6,
         weight_decay = 1e-3,
     )
@@ -683,37 +726,37 @@ if __name__ == "__main__":
         optimizer,
         mode='min',
         factor=0.5,
-        patience=30,
+        patience=300,
         threshold_mode='abs',
         threshold=1e8,
-        min_lr=1e-6
+        min_lr=1e-7
     )
 
     # Time points
     t0 = torch.tensor([[0.0]], requires_grad=True, device=device)
     tf = torch.tensor([[1.0]], requires_grad=True, device=device)
-    t_phys = sample_time_points(350).to(device)
+    t_phys = sample_time_points(1000).to(device)
 
     # Initial conditions
     r0_np = convert_to_eci(launch_lat, launch_lon, 0)  # Launch position
-    r0 = torch.tensor(r0_np, dtype=torch.float64).view(1, 3).to(device)
-    v0 = torch.zeros_like(r0)  # Start at rest
-    m0 = torch.tensor([[rocket_mass]], dtype=torch.float64).to(device)
+    r0 = r0_eci_tensor.to(device)
+    v0 = v0_eci_tensor.to(device)
+    m0 = torch.tensor([[fuel_mass]], dtype=torch.float32).to(device)
 
     # Target orbit position (using optimal true anomaly)
     nu = compute_optimal_true_anomaly(ORBITAL_ELEMENTS, launch_lat, launch_lon, 0)
     r_target_np = rotation_matrix(i, raan, arg_of_perigee) @ position_on_orbit(a, e, nu)
-    r_target = torch.tensor(r_target_np, dtype=torch.float64).view(1, 3).to(device)
+    r_target = torch.tensor(r_target_np, dtype=torch.float32).view(1, 3).to(device)
 
     print("Initial conditions:")
     print(f"  Launch position (ECI): {r0_np}")
     print(f"  Target position (ECI): {r_target_np}")
-    print(f"  Initial mass: {rocket_mass} kg")
-    print(f"  Burn time: {burn_time} seconds")
+    print(f"  Initial mass: {fuel_mass} kg")
+    print(f"  Burn time: {burn_time} seconds\n")
 
     # Training the model
     try:
-        train(model, epochs=100000, optimizer=optimizer, scheduler=scheduler,
+        train(model, epochs=250000, optimizer=optimizer, scheduler=scheduler,
               t_phys=t_phys, t0=t0, tf=tf,
               r0=r0, v0=v0, m0=m0,
               r_target=r_target)
@@ -739,13 +782,13 @@ if __name__ == "__main__":
             print(f"Final position: {test_r_phys[-1].cpu().numpy()}")
             print(f"Target position: {r_target.cpu().numpy()}")
             print(f"Final mass: {test_m_phys[-1].item():.1f} kg")
-            print(f"Mass used: {rocket_mass - test_m_phys[-1].item():.1f} kg")
+            print(f"Mass used: {fuel_mass - test_m_phys[-1].item():.1f} kg")
             f=open('prediction.txt', 'w')
             f.writelines([
                 f"Final position: {test_r_phys[-1].cpu().numpy()}",
                 f"\nTarget position: {r_target.cpu().numpy()}",
                 f"\nFinal mass: {test_m_phys[-1].item():.1f} kg",
-                f"\nMass used: {rocket_mass - test_m_phys[-1].item():.1f} kg"
+                f"\nMass used: {fuel_mass - test_m_phys[-1].item():.1f} kg"
             ])
             f.close()
 
@@ -755,7 +798,7 @@ if __name__ == "__main__":
             print("=" * 50)
 
             # Extract detailed trajectory
-            trajectory = extract_trajectory_points(model, n_points=200)
+            trajectory = extract_trajectory_points(model, n_points=300)
 
             # Display trajectory statistics
             print(f"\nTrajectory Analysis:")

@@ -1,4 +1,4 @@
-Final position: [1883147.2  -789982.5    89191.82]
-Target position: [[5.65223264e+06 3.09833336e+06 3.64829543e+00]]
-Final mass: 752854.2 kg
-Mass used: -2854.2 kg
+Final position: [ 1429522.5 -5562442.   2495427. ]
+Target position: [[ 1.3619305e+09 -5.4741791e+09  3.6687291e+09]]
+Final mass: 231237.9 kg
+Mass used: 227762.1 kg
