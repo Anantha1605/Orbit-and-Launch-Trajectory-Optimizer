@@ -8,7 +8,7 @@ matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from constants import R, earth_rotation_rate, burn_time, launch_lat, launch_lon, fuel_mass, \
     ORBITAL_ELEMENTS, a, i, raan, arg_of_perigee, e, orbital_velocity, Isp, g, v_ground, \
-    v0_eci_tensor, r0_eci_tensor, weights, individual_loss_threshold, phys_scale, init_scale, fuel_scale, term_scale
+    v0_eci_tensor, r0_eci_tensor, weights, individual_loss_threshold, phy_loss_threshold, phys_scale, init_scale, fuel_scale, term_scale
 
 earth_radius = R
 def convert_to_eci(lat, lon, t=0):
@@ -550,7 +550,7 @@ def train(model, epochs, optimizer, scheduler, t_phys, t0, tf, r0, v0, m0, r_tar
 
         # Stop if loss below threshold {Early stopping}
         # Early stopping based on individual component losses
-        if (loss_breakdown["physics"] <= individual_loss_threshold * phys_scale and
+        if (loss_breakdown["physics"] <= phy_loss_threshold * phys_scale and
                 loss_breakdown["initial"] <= individual_loss_threshold * init_scale and
                 loss_breakdown["terminal"] <= individual_loss_threshold * term_scale and
                 loss_breakdown["fuel"] <= individual_loss_threshold * fuel_scale):

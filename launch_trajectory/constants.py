@@ -4,8 +4,8 @@ import numpy as np
 import torch
 
 # Orbital parameters
-ORBITAL_ELEMENTS = [6778137, 0.01, np.radians(51.6), np.radians(45), np.radians(0)]  # [a, e, i, RAAN, omega]
-ORBITAL_ELEMENTS_UNITS = ['km', 'unitless', 'rad', 'rad', 'rad']
+ORBITAL_ELEMENTS = [6778.137, 0.01, np.radians(51.6), np.radians(45), np.radians(0)]  # [a, e, i, RAAN, omega]
+ORBITAL_ELEMENTS_UNITS = ['m', 'unitless', 'rad', 'rad', 'rad']
 
 a_km = ORBITAL_ELEMENTS[0]
 a = a_km * 1000  # convert to meters
@@ -92,15 +92,16 @@ v0_eci_tensor = torch.tensor(v0_eci, dtype=torch.float32).view(1, 3)
 
 # Weights [physics, initial, terminal, fuel efficiency]
 weights = {
-    "phys": 1.5,    # slightly higher to enforce physics
-    "init": 1.0,    # initial conditions are important but less than physics
-    "term": 1.2,    # terminal must converge, slightly higher
-    "fuel": 1.0     # fuel optional, keep reasonable
+    "phys": 5,   # already normalized
+    "init": 2,  #  small
+    "term": 4.5,   # high priority
+    "fuel": 1   # optional, small
 }
 
 # Normalization values
 loss_threshold = 10
-individual_loss_threshold = 1e-3
+individual_loss_threshold = 1e-5
+phy_loss_threshold = 1e-4
 
 # Scaling factor
 phys_scale = 1.0
@@ -109,5 +110,5 @@ term_scale = 1.0
 fuel_scale = 1.0
 
 
-print("\nLoss threshold: ", loss_threshold)
-print("\n")
+#print("\nLoss threshold: ", loss_threshold)
+#print("\n")
